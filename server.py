@@ -2,14 +2,38 @@ import base64
 import io
 import re
 import tempfile
+from contextlib import contextmanager
 from typing import Optional, Tuple
 
 import requests
+import torch
 import torchaudio as ta
 from chatterbox.tts import ChatterboxTTS
 from fastapi.responses import Response
 from litserve import LitAPI, LitServer
 from pydantic import BaseModel, Field, field_validator
+
+
+@contextmanager
+def patched_torch_load(device):
+    """Context manager that patches torch.load to use map_location.
+
+    This fixes RuntimeError when loading CUDA checkpoints on CPU-only machines.
+    The chatterbox library doesn't pass map_location to torch.load, so we patch it.
+    Works correctly on both CPU and GPU systems.
+    """
+    original_load = torch.load
+
+    def patched_load(*args, **kwargs):
+        if "map_location" not in kwargs:
+            kwargs["map_location"] = device
+        return original_load(*args, **kwargs)
+
+    torch.load = patched_load
+    try:
+        yield
+    finally:
+        torch.load = original_load
 
 
 class TTSRequest(BaseModel):
@@ -75,7 +99,8 @@ class ChatterboxTTSAPI(LitAPI):
 
     def setup(self, device):
         """Initialize the Chatterbox TTS model."""
-        self.model = ChatterboxTTS.from_pretrained(device=device)
+        with patched_torch_load(device):
+            self.model = ChatterboxTTS.from_pretrained(device=device)
         self.temp_files = []  # Track temp files for cleanup
 
     def decode_request(self, request: TTSRequest) -> Tuple:
@@ -139,7 +164,17 @@ class ChatterboxTTSAPI(LitAPI):
 
 
 if __name__ == "__main__":
-    # Set up API service and server
+    import os
+
+    # Determine accelerator: use DEVICE env var if set, otherwise auto-detect
+    device_env = os.environ.get("DEVICE", "").lower()
+    if device_env == "cpu":
+        accelerator = "cpu"
+    elif device_env in ("cuda", "gpu"):
+        accelerator = "cuda"
+    else:
+        accelerator = "auto"
+
     api = ChatterboxTTSAPI(api_path="/speech")
-    server = LitServer(api, accelerator="auto", timeout=100)
+    server = LitServer(api, accelerator=accelerator, timeout=100)
     server.run(port=8000)
