@@ -1,11 +1,14 @@
 # Change CUDA and cuDNN version here
 FROM nvidia/cuda:12.4.1-base-ubuntu22.04
 ARG PYTHON_VERSION=3.12
+ARG REPO_URL=https://github.com/f-liva/litserve-chatterbox-tts.git
+ARG REPO_BRANCH=main
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common \
         wget \
+        git \
     && add-apt-repository ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
         python$PYTHON_VERSION \
@@ -22,15 +25,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-####### Add your own installation commands here #######
-# RUN pip install some-package
-# RUN wget https://path/to/some/data/or/weights
-# RUN apt-get update && apt-get install -y <package-name>
+# Clone the repository
+RUN git clone --depth 1 --branch $REPO_BRANCH $REPO_URL /app
 
 WORKDIR /app
-COPY . /app
 
-# Install litserve and requirements
-RUN pip install --no-cache-dir litserve==0.2.11 -r requirements.txt
+# Install requirements
+RUN pip install --no-cache-dir -r requirements.txt
+
 EXPOSE 8000
 CMD ["python", "/app/server.py"]
