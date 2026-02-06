@@ -1,5 +1,6 @@
 import base64
 import io
+import os
 import re
 import tempfile
 from contextlib import contextmanager
@@ -8,10 +9,11 @@ from typing import Optional, Tuple
 import requests
 import torch
 import torchaudio as ta
-from chatterbox.tts import ChatterboxTTS
 from fastapi.responses import Response
 from litserve import LitAPI, LitServer
 from pydantic import BaseModel, Field, field_validator
+
+MODEL_TYPES = ("original", "turbo", "multilingual")
 
 
 @contextmanager
@@ -36,6 +38,22 @@ def patched_torch_load(device):
         torch.load = original_load
 
 
+def load_model(model_type: str, device: str):
+    """Load the appropriate Chatterbox model based on model_type."""
+    if model_type == "turbo":
+        from chatterbox.tts_turbo import ChatterboxTurboTTS
+
+        return ChatterboxTurboTTS.from_pretrained(device=device)
+    elif model_type == "multilingual":
+        from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+
+        return ChatterboxMultilingualTTS.from_pretrained(device=device)
+    else:
+        from chatterbox.tts import ChatterboxTTS
+
+        return ChatterboxTTS.from_pretrained(device=device)
+
+
 class TTSRequest(BaseModel):
     text: str = Field(
         ..., min_length=1, max_length=500, description="Input text to synthesize"
@@ -46,6 +64,9 @@ class TTSRequest(BaseModel):
     exaggeration: float = Field(0.5, ge=0.0, le=1.0)
     cfg: float = Field(0.5, ge=0.0, le=1.0)
     temperature: float = Field(0.8, ge=0.0, le=1.0)
+    language_id: Optional[str] = Field(
+        None, description="Language code for multilingual model (e.g. 'fr', 'zh', 'it')"
+    )
 
     @field_validator("audio_prompt")
     def validate_audio_prompt(cls, v):
@@ -92,18 +113,23 @@ class TTSRequest(BaseModel):
 
 
 class ChatterboxTTSAPI(LitAPI):
-    """LitServe API for Chatterbox TTS model.
+    """LitServe API for Chatterbox TTS models.
 
-    Supports both text-to-speech and voice cloning with audio prompts.
+    Supports original, turbo, and multilingual models via MODEL_TYPE env var.
     """
 
     def setup(self, device):
         """Initialize the Chatterbox TTS model."""
+        self.model_type = os.environ.get("MODEL_TYPE", "original").lower()
+        if self.model_type not in MODEL_TYPES:
+            raise ValueError(
+                f"Invalid MODEL_TYPE '{self.model_type}'. Must be one of: {MODEL_TYPES}"
+            )
         with patched_torch_load(device):
-            self.model = ChatterboxTTS.from_pretrained(device=device)
-        self.temp_files = []  # Track temp files for cleanup
+            self.model = load_model(self.model_type, device)
+        self.temp_files = []
 
-    def decode_request(self, request: TTSRequest) -> Tuple:
+    def decode_request(self, request: TTSRequest) -> dict:
         """Decode request using TTSRequest model."""
         audio_prompt_path = request.get_audio_tempfile()
 
@@ -111,39 +137,37 @@ class ChatterboxTTSAPI(LitAPI):
         if audio_prompt_path and audio_prompt_path != request.audio_prompt:
             self.temp_files.append(audio_prompt_path)
 
-        return (
-            request.text,
-            audio_prompt_path,
-            request.exaggeration,
-            request.cfg,
-            request.temperature,
-        )
+        return {
+            "text": request.text,
+            "audio_prompt_path": audio_prompt_path,
+            "exaggeration": request.exaggeration,
+            "cfg": request.cfg,
+            "temperature": request.temperature,
+            "language_id": request.language_id,
+        }
 
-    def predict(self, inputs: Tuple) -> bytes:
-        """Generate speech audio using Chatterbox TTS."""
-        text, audio_prompt_path, exaggeration, cfg, temperature = inputs
-
+    def predict(self, inputs: dict) -> bytes:
+        """Generate speech audio using the loaded Chatterbox model."""
         try:
-            wav = self.model.generate(
-                text,
-                audio_prompt_path=audio_prompt_path,
-                exaggeration=exaggeration,
-                cfg_weight=cfg,
-                temperature=temperature,
-            )
-            # Convert to bytes
+            kwargs = {"audio_prompt_path": inputs["audio_prompt_path"]}
+
+            if self.model_type == "original":
+                kwargs["exaggeration"] = inputs["exaggeration"]
+                kwargs["cfg_weight"] = inputs["cfg"]
+                kwargs["temperature"] = inputs["temperature"]
+            elif self.model_type == "multilingual" and inputs["language_id"]:
+                kwargs["language_id"] = inputs["language_id"]
+
+            wav = self.model.generate(inputs["text"], **kwargs)
+
             buffer = io.BytesIO()
             ta.save(buffer, wav, self.model.sr, format="wav")
-            audio_bytes = buffer.getvalue()
-            return audio_bytes
+            return buffer.getvalue()
         finally:
-            # Clean up temp files
             self._cleanup_temp_files()
 
     def _cleanup_temp_files(self):
         """Clean up temporary files."""
-        import os
-
         for temp_file in self.temp_files:
             try:
                 if os.path.exists(temp_file):
@@ -164,8 +188,6 @@ class ChatterboxTTSAPI(LitAPI):
 
 
 if __name__ == "__main__":
-    import os
-
     # Determine accelerator: use DEVICE env var if set, otherwise auto-detect
     device_env = os.environ.get("DEVICE", "").lower()
     if device_env == "cpu":
